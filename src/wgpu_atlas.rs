@@ -1,4 +1,6 @@
 // Modified for gpui-pre (snapshot of zed@f126950): adapt device queues and sRGB detection to wgpu 30.0.1.
+// penguin: patched for external tiles (`insert_external`, `atlas_for_window`); see
+// penguin/docs/gpui-desktop-plan.md.
 use anyhow::{Context as _, Result};
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
@@ -6,7 +8,13 @@ use gpui::{
     AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size,
 };
 use parking_lot::Mutex;
-use std::{borrow::Cow, ops, sync::Arc};
+use raw_window_handle::RawWindowHandle;
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    ops,
+    sync::{Arc, Weak},
+};
 
 use crate::WgpuContext;
 
@@ -36,6 +44,8 @@ struct WgpuAtlasTextures {
     color_texture_format: wgpu::TextureFormat,
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
+    /// penguin: the next allocation is an external tile (`WgpuAtlas::insert_external`).
+    external_next: bool,
     next_texture_generation: u64,
 }
 
@@ -59,6 +69,7 @@ impl WgpuAtlas {
             color_texture_format,
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
+            external_next: false,
             next_texture_generation: 0,
         })))
     }
@@ -69,6 +80,42 @@ impl WgpuAtlas {
             context.queue.clone(),
             context.color_texture_format(),
         )
+    }
+
+    /// penguin: the device and queue the atlas textures live on.
+    pub fn device_queue(&self) -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
+        let lock = self.0.lock();
+        (lock.backend.device.clone(), lock.backend.queue.clone())
+    }
+
+    /// penguin: a polychrome tile under `key` on a texture of exactly `size` that nothing else
+    /// shares, renderable and never uploaded to: the caller draws into it on the GPU, and GPUI
+    /// draws it as an ordinary sprite (`Window::paint_image` with the image `key` names). The
+    /// texture is uninitialized for wgpu until the caller writes it through wgpu once. An existing
+    /// tile under `key` is returned as it is.
+    pub fn insert_external(
+        &self,
+        key: AtlasKey,
+        size: Size<DevicePixels>,
+    ) -> Result<ExternalTile> {
+        let mut lock = self.0.lock();
+        lock.backend.external_next = true;
+        let tile = lock.get_or_insert_with(key, &mut || Ok(Some((size, Cow::Borrowed(&[][..])))));
+        lock.backend.external_next = false;
+
+        // The builder above always gives a size, so the atlas always gives a tile
+        let tile = tile?.context("the atlas gave no tile")?;
+        let texture = lock
+            .backend
+            .storage
+            .get(tile.texture_id)
+            .filter(|texture| texture.external)
+            .context("the tile under this key is not external")?;
+
+        Ok(ExternalTile {
+            tile,
+            texture: texture.texture.clone(),
+        })
     }
 
     pub fn before_frame(&self) {
@@ -111,6 +158,37 @@ impl WgpuAtlas {
     }
 }
 
+/// penguin: a tile from [`WgpuAtlas::insert_external`] and the texture it covers whole.
+pub struct ExternalTile {
+    pub tile: AtlasTile,
+    pub texture: wgpu::Texture,
+}
+
+thread_local! {
+    /// penguin: each window's atlas, by the window handle its renderer was made for: GPUI keeps
+    /// the atlas behind `dyn PlatformAtlas` in a private field of `Window`.
+    static WINDOW_ATLASES: RefCell<Vec<(RawWindowHandle, Weak<WgpuAtlas>)>> = RefCell::default();
+}
+
+/// penguin: the atlas of the window `handle` names (`HasWindowHandle` on GPUI's `Window`), made on
+/// this thread.
+pub fn atlas_for_window(handle: RawWindowHandle) -> Option<Arc<WgpuAtlas>> {
+    WINDOW_ATLASES.with_borrow_mut(|atlases| {
+        atlases.retain(|(_, atlas)| atlas.strong_count() > 0);
+        atlases
+            .iter()
+            .find(|(h, _)| *h == handle)
+            .and_then(|(_, atlas)| atlas.upgrade())
+    })
+}
+
+pub(crate) fn register_window_atlas(handle: RawWindowHandle, atlas: &Arc<WgpuAtlas>) {
+    WINDOW_ATLASES.with_borrow_mut(|atlases| {
+        atlases.retain(|(h, atlas)| *h != handle && atlas.strong_count() > 0);
+        atlases.push((handle, Arc::downgrade(atlas)));
+    });
+}
+
 impl PlatformAtlas for WgpuAtlas {
     fn get_or_insert_with<'a>(
         &self,
@@ -132,6 +210,12 @@ impl AtlasBackend for WgpuAtlasTextures {
         size: Size<DevicePixels>,
         bytes: &[u8],
     ) -> Result<AtlasTile> {
+        // penguin: an external tile gets a texture of its own and no upload
+        if self.external_next {
+            let texture = self.push_texture(size, kind, true);
+            return texture.allocate(size).context("failed to allocate");
+        }
+
         let tile = self.allocate(size, kind).context("failed to allocate")?;
         self.upload_texture(tile.texture_id, tile.bounds, bytes);
         Ok(tile)
@@ -171,13 +255,14 @@ impl WgpuAtlasTextures {
             if let Some(tile) = textures
                 .iter_mut()
                 .rev()
+                .filter(|texture| !texture.external)
                 .find_map(|texture| texture.allocate(size))
             {
                 return Some(tile);
             }
         }
 
-        let texture = self.push_texture(size, texture_kind);
+        let texture = self.push_texture(size, texture_kind, false);
         texture.allocate(size)
     }
 
@@ -185,6 +270,7 @@ impl WgpuAtlasTextures {
         &mut self,
         min_size: Size<DevicePixels>,
         kind: AtlasTextureKind,
+        external: bool,
     ) -> &mut WgpuAtlasTexture {
         const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(1024),
@@ -196,7 +282,10 @@ impl WgpuAtlasTextures {
             height: DevicePixels(max_texture_size),
         };
 
-        let size = min_size.min(&max_atlas_size).max(&DEFAULT_ATLAS_SIZE);
+        let size = match external {
+            true => min_size.min(&max_atlas_size),
+            false => min_size.min(&max_atlas_size).max(&DEFAULT_ATLAS_SIZE),
+        };
         let format = match kind {
             AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
             AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,
@@ -213,7 +302,17 @@ impl WgpuAtlasTextures {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            // penguin: an external texture is drawn into; Skia's Vulkan backend wraps only
+            // images it can also copy from and into
+            usage: match external {
+                true => {
+                    wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT
+                }
+                false => wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            },
             view_formats: &[],
         });
 
@@ -235,6 +334,7 @@ impl WgpuAtlasTextures {
             texture,
             view,
             live_atlas_keys: 0,
+            external,
         };
 
         if let Some(ix) = index {
@@ -344,6 +444,8 @@ struct WgpuAtlasTexture {
     view: wgpu::TextureView,
     format: wgpu::TextureFormat,
     live_atlas_keys: u32,
+    /// penguin: from `insert_external`: one tile, drawn into by the caller.
+    external: bool,
 }
 
 impl WgpuAtlasTexture {

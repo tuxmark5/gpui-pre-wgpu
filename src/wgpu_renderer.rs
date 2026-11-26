@@ -347,6 +347,8 @@ impl WgpuRenderer {
         };
 
         let atlas = Arc::new(WgpuAtlas::from_context(context));
+        // penguin: findable from the window (`atlas_for_window`)
+        crate::register_window_atlas(window_handle.as_raw(), &atlas);
 
         Self::new_internal(
             Some(Rc::clone(&gpu_context)),
